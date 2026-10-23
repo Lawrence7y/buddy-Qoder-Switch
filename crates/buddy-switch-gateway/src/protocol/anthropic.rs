@@ -1,0 +1,1410 @@
+//! Anthropic `/v1/messages` 协议：请求双向转换（含 tool use）+ 上游 SSE → Anthropic 事件流。
+
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::Bytes;
+use futures_util::Stream;
+use serde_json::{json, Map, Value};
+
+use super::openai::{sse_event, CompletionAccumulator};
+
+/// 把 Anthropic content（字符串或 content block 数组）中的文本拼出来。
+fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// tool_result 的 content 可能是字符串或 text block 数组。
+fn tool_result_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(value @ Value::Array(_)) => content_to_text(value),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// Anthropic 请求 → 上游（OpenAI 形态）请求体。
+///
+/// 关键映射（A-5.2）：
+/// - 顶层 `system` → `messages[0] {role:"system"}`
+/// - assistant `tool_use` block → `tool_calls`
+/// - user `tool_result` block → 独立 `{role:"tool",tool_call_id,content}` 消息
+/// - 同一条 user 消息里的文本块排在工具结果**之后**：`role:"tool"` 必须紧邻发起
+///   调用的 assistant 消息，否则上游判 `tool_call_sequence_broken`
+/// - `tools[{name,description,input_schema}]` → `tools[{type:"function",function:{...parameters}}]`
+/// - `tool_choice`（auto/any/tool）→ 上游字符串形态
+/// - `stop_sequences` → `stop`；强制 `stream:true`
+pub fn to_upstream_request(body: &Value) -> Value {
+    let mut out = Map::new();
+
+    for key in ["model", "max_tokens", "temperature", "top_p"] {
+        if let Some(value) = body.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(stop) = body.get("stop_sequences") {
+        out.insert("stop".to_string(), stop.clone());
+    }
+    // 上游不接受非流式（L4）：强制 stream。
+    out.insert("stream".to_string(), json!(true));
+
+    // tools：schema 包装转换。
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                let name = tool.get("name").cloned().unwrap_or_else(|| json!(""));
+                let description = tool
+                    .get("description")
+                    .cloned()
+                    .unwrap_or_else(|| json!(""));
+                let parameters = tool
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                })
+            })
+            .collect();
+        if !converted.is_empty() {
+            out.insert("tools".to_string(), Value::Array(converted));
+        }
+    }
+
+    // tool_choice 映射。
+    if let Some(tool_choice) = body.get("tool_choice") {
+        match tool_choice.get("type").and_then(Value::as_str) {
+            Some("auto") => {
+                out.insert("tool_choice".to_string(), json!("auto"));
+            }
+            Some("any") => {
+                out.insert("tool_choice".to_string(), json!("required"));
+            }
+            Some("tool") => {
+                if let Some(name) = tool_choice.get("name").and_then(Value::as_str) {
+                    out.insert("tool_choice".to_string(), json!(name));
+                }
+            }
+            Some("none") => {
+                out.remove("tools");
+            }
+            _ => {}
+        }
+    }
+
+    // messages：system + 逐条转换。
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(system) = body.get("system") {
+        let text = content_to_text(system);
+        if !text.is_empty() {
+            messages.push(json!({"role": "system", "content": text}));
+        }
+    }
+
+    if let Some(input) = body.get("messages").and_then(Value::as_array) {
+        for message in input {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .to_string();
+            match message.get("content") {
+                Some(Value::String(text)) => {
+                    messages.push(json!({"role": role, "content": text}));
+                }
+                Some(value @ Value::Array(blocks)) => {
+                    let text = content_to_text(value);
+                    let mut tool_calls: Vec<Value> = Vec::new();
+                    let mut tool_results: Vec<Value> = Vec::new();
+                    for block in blocks {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("tool_use") => {
+                                let id = block.get("id").cloned().unwrap_or_else(|| json!(""));
+                                let name = block.get("name").cloned().unwrap_or_else(|| json!(""));
+                                let input =
+                                    block.get("input").cloned().unwrap_or_else(|| json!({}));
+                                let arguments = serde_json::to_string(&input)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": { "name": name, "arguments": arguments },
+                                }));
+                            }
+                            Some("tool_result") => {
+                                let tool_call_id = block
+                                    .get("tool_use_id")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!(""));
+                                let content = tool_result_to_text(block.get("content"));
+                                tool_results.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": content,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if role == "assistant" {
+                        let mut assistant = Map::new();
+                        assistant.insert("role".to_string(), json!("assistant"));
+                        if !text.is_empty() {
+                            assistant.insert("content".to_string(), json!(text));
+                        } else if !tool_calls.is_empty() {
+                            assistant.insert("content".to_string(), Value::Null);
+                        }
+                        if !tool_calls.is_empty() {
+                            assistant.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                        }
+                        if assistant.len() > 1 {
+                            messages.push(Value::Object(assistant));
+                        }
+                    } else {
+                        // 顺序不可交换：`role:"tool"` 必须**紧跟**发起该调用的
+                        // assistant 消息，中间插入任何消息都会被上游判
+                        // `tool_call_sequence_broken`（400，tool calls and tool
+                        // results do not match）。因此同一条 user 消息里的文本块
+                        // （Claude Code 的插话 / 中断说明）排在工具结果**之后**，
+                        // 作为本轮结果之后的新用户发言。
+                        messages.extend(tool_results);
+                        if !text.is_empty() {
+                            messages.push(json!({"role": "user", "content": text}));
+                        }
+                    }
+                }
+                _ => {
+                    messages.push(json!({"role": role}));
+                }
+            }
+        }
+    }
+
+    out.insert("messages".to_string(), Value::Array(messages));
+    Value::Object(out)
+}
+
+/// `finish_reason` → Anthropic `stop_reason`（stop→end_turn、length→max_tokens、tool_calls→tool_use）。
+pub fn map_stop_reason(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        Some("stop") => "end_turn",
+        Some("length") => "max_tokens",
+        Some("tool_calls") | Some("function_call") => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+/// 上游没给 `usage` 时，按产出字节数估算 token（**唯一实现**）。
+///
+/// ## 为什么必须估算，不能填 0（2026-10-20/21 真机取证）
+///
+/// Qoder 上游的 SSE 经常**不带 usage**；`capture_usage` 拿不到就保持初始值 0，
+/// 于是 `message_delta` 恒报 `"output_tokens": 0`，且 `input_tokens` 干脆不发 ——
+/// 客户端（ZCode / AI SDK 系）读的是**末尾**那次 usage。AI SDK 把「本回合零产出」
+/// 解读成回合被判空，用户侧症状就是「回答截断 / 状态栏用量恒为 0」。
+/// 实测：走 `/v1/messages` 的 144/144 条记录 input 全 0；同期 ZCode 状态栏数据失真。
+///
+/// ## 为什么是「字节数 / 3」
+///
+/// 这是**下界量级估算**，不是精确计数：英文约 4 字符/token、中文约 1.5–2 字符/token
+/// （UTF-8 中文 3 字节）；按字节 / 3 对中英混排给出偏保守（略小于真实值）的量级，
+/// 足以让客户端判定「有产出」，又不会把上下文占用算爆。
+///
+/// 只在**确实有输出**且上游没报 usage 时启用；上游报过数字（哪怕报的是 0）
+/// **一律原样透传**，估算绝不覆盖真实数字。回退开关：
+/// `BUDDY_SWITCH_USAGE_ESTIMATE=off`（恢复恒 0 的旧形态）。
+fn estimate_tokens(bytes: usize) -> u64 {
+    if !usage_estimate_enabled() {
+        return 0;
+    }
+    // 至少 1：只要有输出就不该报 0（那正是要修的 bug）。
+    ((bytes / 3) as u64).max(1)
+}
+
+/// 估算兜底开关（默认开）。读不到变量按默认；显式 `off/0/false` 关闭。
+fn usage_estimate_enabled() -> bool {
+    !matches!(
+        std::env::var("BUDDY_SWITCH_USAGE_ESTIMATE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
+/// 聚合上游 SSE 为 Anthropic `message` 对象（非流式请求）。
+pub fn aggregate_message(sse_text: &str, fallback_model: &str) -> Value {
+    message_from_accumulator(&CompletionAccumulator::from_sse(sse_text), fallback_model)
+}
+
+/// 由**上游完整响应体**（OpenAI JSON）构造 Anthropic `message` 对象。
+///
+/// 与 [`aggregate_message`] 的差别只在输入形态：那个吃 SSE 文本，这个吃一次性 JSON
+/// （Trae 网关的上游聚合结果就是后者）。两条路径共用 [`message_from_accumulator`]，
+/// 因此 Anthropic 的字段映射（`stop_reason` 归一、`usage` 改名、tool_use 拆分）
+/// **只有一处实现** —— 否则两条路径迟早会在这类细节上分家。
+pub fn message_from_response(response: &Value, fallback_model: &str) -> Value {
+    message_from_accumulator(
+        &CompletionAccumulator::from_response(response),
+        fallback_model,
+    )
+}
+
+/// Anthropic `message` 对象的**唯一构造点**（见上面两个入口）。
+fn message_from_accumulator(accumulator: &CompletionAccumulator, fallback_model: &str) -> Value {
+    let id = accumulator
+        .id
+        .clone()
+        .map(|id| format!("msg_{id}"))
+        .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
+    let model = accumulator
+        .model
+        .clone()
+        .unwrap_or_else(|| fallback_model.to_string());
+
+    let mut content: Vec<Value> = Vec::new();
+    // ★ 思考块：accumulator 单独存了 `reasoning`，不输出就等于在 Anthropic 形态里
+    //   **丢掉整段思考**。thinking 块置于 text 之前（与流式块序一致）。
+    if !accumulator.reasoning.is_empty() {
+        content.push(json!({"type": "thinking", "thinking": accumulator.reasoning}));
+    }
+    if !accumulator.content.is_empty() {
+        content.push(json!({"type": "text", "text": accumulator.content}));
+    }
+    for tool_call in &accumulator.tool_calls {
+        let input: Value = serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+        content.push(json!({
+            "type": "tool_use",
+            "id": tool_call.id,
+            "name": tool_call.name,
+            "input": input,
+        }));
+    }
+
+    // ★ 与流式路径**同一套** usage 兜底：上游没报 `completion_tokens` 时按产出估算，
+    //   不恒填 0（见 [`estimate_tokens`] 的来龙去脉）。`input_tokens` 的估算原料
+    //   是提示词字节数，但聚合入口拿不到原始请求体 —— 上游报过就用（Qoder 非流式
+    //   会带 usage），没报就如实 0，由**流式路径**（ZCode 实际走的那条）负责补估。
+    let output_tokens = match accumulator.completion_tokens {
+        Some(reported) => reported,
+        None => {
+            // 思考内容同样是真实产出，计入估算口径。
+            let bytes = accumulator.reasoning.len()
+                + accumulator.content.len()
+                + accumulator
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.arguments.len())
+                    .sum::<usize>();
+            if bytes == 0 {
+                0
+            } else {
+                estimate_tokens(bytes)
+            }
+        }
+    };
+
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": map_stop_reason(accumulator.finish_reason.as_deref()),
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": accumulator.prompt_tokens.unwrap_or(0),
+            "output_tokens": output_tokens,
+            // 与流式路径同形（两入口共用本函数是字段一致性的护栏）。
+            "cache_read_input_tokens": accumulator.cached_tokens.unwrap_or(0),
+        },
+    })
+}
+
+/// 上游 OpenAI SSE → Anthropic SSE 事件流的转换流。
+///
+/// 完整事件序列：`message_start` → `content_block_start` → `content_block_delta`
+/// → `content_block_stop` → `message_delta` → `message_stop`。
+pub struct AnthropicSseStream<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    model: String,
+    message_id: String,
+    started: bool,
+    finished: bool,
+    next_index: i64,
+    text_index: Option<i64>,
+    /// Anthropic `thinking` 块索引（`reasoning_content` → thinking_delta 的落点）。
+    ///
+    /// ★ 2026-10-21：此前本转换层把 `reasoning_content` **静默丢弃** ——
+    ///   `/v1/messages` 路径（ZCode anthropic-messages 供应商）看不到任何思考过程，
+    ///   且思考字节不进 `output_tokens` 估算。现映射为标准 `thinking` 块。
+    thinking_index: Option<i64>,
+    tool_index: HashMap<i64, i64>,
+    open_tools: Vec<i64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    /// 上游报过的**缓存读** token（`prompt_tokens_details.cached_tokens`）。
+    ///
+    /// OpenAI 兼容路径原样透传该字段（ZCode 记得到真实值），Anthropic 路径此前
+    /// 同样丢失 ⇒ 状态栏缓存读恒 0。映射为 `cache_read_input_tokens`。
+    cached_tokens: u64,
+    /// 入站请求的**提示词字节数**（`input_tokens` 估算的原料）。
+    ///
+    /// 上游经常不报 `prompt_tokens`（Qoder 全线如此），而 `message_start`
+    /// 又必须在上游 usage 到达前发出 ⇒ 若不估算，客户端记录的
+    /// input 就恒为 0（用户看到「输入零 token、上下文容量 0」的不真实数据）。
+    prompt_bytes: usize,
+    /// 上游是否**明确**报过 `completion_tokens`。
+    ///
+    /// 只有它为 `false` 时才允许用字节估算兜底 —— 上游给过数字就必须原样透传
+    /// （哪怕上游报的就是 0，那也是上游的判断，不该被我们改写）。
+    output_tokens_reported: bool,
+    /// 已产出的正文字节数（`output_tokens` 估算的原料）。
+    emitted_bytes: usize,
+    /// 已产出的工具入参字节数（同上；工具调用同样是「模型产出」）。
+    emitted_tool_bytes: usize,
+    stop_reason: String,
+    pending: VecDeque<Bytes>,
+}
+
+impl<S> AnthropicSseStream<S> {
+    /// 新建转换流。
+    pub fn new(inner: S, model: String) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            model,
+            message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            started: false,
+            finished: false,
+            next_index: 0,
+            text_index: None,
+            thinking_index: None,
+            tool_index: HashMap::new(),
+            open_tools: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            prompt_bytes: 0,
+            output_tokens_reported: false,
+            emitted_bytes: 0,
+            emitted_tool_bytes: 0,
+            stop_reason: "end_turn".to_string(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// 告知本回合的**提示词字节数**（`input_tokens` 估算的原料）。
+    pub fn with_prompt_bytes(mut self, bytes: usize) -> Self {
+        self.prompt_bytes = bytes;
+        self
+    }
+
+    fn emit(&mut self, event: &str, data: Value) {
+        self.pending.push_back(sse_event(event, &data));
+    }
+
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.emit(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": 0, "output_tokens": 0 },
+                }
+            }),
+        );
+    }
+
+    fn ingest(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(position) = self.buffer.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=position).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                self.finalize();
+                return;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                self.handle_delta(&value);
+                if self.finished {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn handle_delta(&mut self, value: &Value) {
+        if let Some(error) = value.get("error").filter(|v| !v.is_null()) {
+            let kind = error
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("api_error");
+            let kind = match kind {
+                "authentication_error"
+                | "permission_error"
+                | "invalid_request_error"
+                | "not_found_error"
+                | "rate_limit_error"
+                | "overloaded_error" => kind,
+                _ => "api_error",
+            };
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("上游响应失败");
+            self.fail(kind, message);
+            return;
+        }
+        self.ensure_started();
+        if let Some(model) = value.get("model").and_then(Value::as_str) {
+            if !model.is_empty() {
+                self.model = model.to_string();
+            }
+        }
+        if let Some(usage) = value.get("usage") {
+            self.capture_usage(usage);
+        }
+
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return;
+        };
+
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.push_text(text);
+                }
+            }
+            // ★ 思考内容：上游 OpenAI 形态的 `reasoning_content` 此前被本转换层
+            //   **静默丢弃** —— anthropic-messages 供应商看不到任何思考过程。
+            //   映射为标准 Anthropic `thinking` 块（快照→增量差分由外层完成，
+            //   这里拿到的是已差分的增量）。
+            if let Some(thinking) = delta.get("reasoning_content").and_then(Value::as_str) {
+                if !thinking.is_empty() {
+                    self.push_thinking(thinking);
+                }
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    self.push_tool_call(tool_call);
+                }
+            }
+        }
+
+        // `finish_reason` 的**空值形态**不是终止信号：上游 OpenAI 兼容实现常在中间分片里
+        // 写 `""`（而非标准的 `null`）。`as_str()` 对 `""` 会返回 `Some("")`，若直接据此
+        // `finalize`，转换流会在第一个分片就收尾，客户端表现为「流式对话刚开始就断了」。
+        if let Some(finish_reason) = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        {
+            self.stop_reason = map_stop_reason(Some(finish_reason)).to_string();
+            self.finalize();
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        // 思考块若还开着（thinking → text 的正常块序），先关掉再开正文块。
+        if let Some(thinking_index) = self.thinking_index.take() {
+            self.emit(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": thinking_index}),
+            );
+        }
+        self.emitted_bytes += text.len();
+        let index = match self.text_index {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.text_index = Some(index);
+                self.emit(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                );
+                index
+            }
+        };
+        self.emit(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "text_delta", "text": text },
+            }),
+        );
+    }
+
+    /// 上游的思考增量 → 标准 Anthropic `thinking` 块。思考内容**同样计入
+    /// 产出字节**（它是真实的模型产出，参与 `output_tokens` 估算口径）。
+    fn push_thinking(&mut self, text: &str) {
+        // 正文块若已开（上游乱序），先关掉再开思考块，维持 thinking → text 块序。
+        if let Some(text_index) = self.text_index.take() {
+            self.emit(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": text_index}),
+            );
+        }
+        let index = match self.thinking_index {
+            Some(index) => index,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.thinking_index = Some(index);
+                self.emit(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": { "type": "thinking", "thinking": "" },
+                    }),
+                );
+                index
+            }
+        };
+        self.emitted_bytes += text.len();
+        self.emit(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "thinking_delta", "thinking": text },
+            }),
+        );
+    }
+
+    fn push_tool_call(&mut self, tool_call: &Value) {
+        let upstream_index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let index = if let Some(&index) = self.tool_index.get(&upstream_index) {
+            index
+        } else {
+            // 关闭已打开的文本块，开启新的 tool_use 块。
+            if let Some(text_index) = self.text_index.take() {
+                self.emit(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": text_index}),
+                );
+            }
+            let index = self.next_index;
+            self.next_index += 1;
+            self.tool_index.insert(upstream_index, index);
+            self.open_tools.push(index);
+            let id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            self.emit(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} },
+                }),
+            );
+            index
+        };
+
+        if let Some(arguments) = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+        {
+            if !arguments.is_empty() {
+                // 工具入参同样是「模型产出」：估算兜底要把这些字节算进去。
+                self.emitted_tool_bytes += arguments.len();
+                self.emit(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "input_json_delta", "partial_json": arguments },
+                    }),
+                );
+            }
+        }
+    }
+
+    fn capture_usage(&mut self, usage: &Value) {
+        if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            self.input_tokens = prompt;
+        }
+        if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
+            self.output_tokens = completion;
+            // ★ 上游**明确报过**就必须原样透传（哪怕它报的是 0）——
+            //   估算只用于「上游压根没说」的情形，绝不能覆盖真实数字。
+            self.output_tokens_reported = true;
+        }
+        // ★ 缓存读：OpenAI 兼容路径原样透传 `prompt_tokens_details.cached_tokens`
+        //   （ZCode 记得到真实值），Anthropic 路径此前丢失 ⇒ 状态栏缓存读恒 0。
+        if let Some(cached) = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cached_tokens = cached;
+        }
+    }
+
+    /// 本回合最终对外报告的 `input_tokens`（**唯一出口**）。
+    ///
+    /// 上游报过 ⇒ 原样用。没报（Qoder 常见）⇒ **不填 0**，按提示词字节数估算
+    /// （口径见 [`estimate_tokens`]）。`prompt_bytes` 也为 0（调用方没给原料）
+    /// 时保持 0 —— 宁缺毋造。
+    fn reported_input_tokens(&self) -> u64 {
+        if self.input_tokens > 0 {
+            return self.input_tokens;
+        }
+        if self.prompt_bytes == 0 {
+            0
+        } else {
+            estimate_tokens(self.prompt_bytes)
+        }
+    }
+
+    /// 本回合是否**彻底零产出**（没有任何正文 / 工具调用 / 工具入参）。
+    ///
+    /// 判据全部基于「实际发出去的内容」，不看上游报的 token：上游可能在空流里
+    /// 也报 `completion_tokens: 5`，那个数字不可信。
+    fn is_silently_empty(&self) -> bool {
+        self.emitted_bytes == 0
+            && self.emitted_tool_bytes == 0
+            && self.tool_index.is_empty()
+            && self.text_index.is_none()
+            && self.thinking_index.is_none()
+    }
+
+    /// 本回合最终对外报告的 `output_tokens`（**唯一出口**）。
+    ///
+    /// 优先级：上游明确报过 → 原样用；否则按已产出字节估算；完全没有产出
+    /// （空白回合）⇒ 0，如实报告。
+    fn reported_output_tokens(&self) -> u64 {
+        if self.output_tokens_reported {
+            return self.output_tokens;
+        }
+        let bytes = self.emitted_bytes + self.emitted_tool_bytes;
+        if bytes == 0 {
+            0
+        } else {
+            estimate_tokens(bytes)
+        }
+    }
+
+    fn finalize(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.ensure_started();
+        if let Some(text_index) = self.text_index.take() {
+            self.emit(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": text_index}),
+            );
+        }
+        // ★ 思考块收尾：纯思考回合（reasoning 后没等到正文就 finish）也要正确
+        //   配对 content_block_stop，否则客户端挂着一个未闭合的 thinking 块。
+        if let Some(thinking_index) = self.thinking_index.take() {
+            self.emit(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": thinking_index}),
+            );
+        }
+        // 先整体取出待关闭的工具块索引，释放对 self 的可变借用后再逐条 emit，
+        // 避免 drain 持有跨迭代借用与 self.emit 的 &mut self 冲突。
+        let open_tools = std::mem::take(&mut self.open_tools);
+        for index in open_tools {
+            self.emit(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            );
+        }
+        self.emit(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": self.stop_reason, "stop_sequence": Value::Null },
+                // ★ 走 `reported_output_tokens()`：上游没报 usage 时按字节估算，
+                //   而不是恒填 0（恒 0 会让 AI SDK 系客户端把回合判成空回复）。
+                //   `stop_reason` 不受估算影响 —— 截断仍须如实报 `max_tokens`。
+                //
+                // ★★ `input_tokens` 必须在这里补上（2026-10-20 真机取证）：
+                //   `message_start` 先发、那时上游 usage 还没到，只能写 0；
+                //   若这里也不补，客户端（ZCode / AI SDK 系）记录的
+                //   **input 永远是 0** —— 用户看到的就是「用量统计里输入为零、
+                //   上下文容量恒为 0」这种明显不真实的数据。
+                //   实测：buddy switch 代理下 144/144 条记录的 input_tokens 全是 0，
+                //   而直连 provider 的同一指标正常，正是这里漏补所致。
+                "usage": {
+                    "input_tokens": self.reported_input_tokens(),
+                    "output_tokens": self.reported_output_tokens(),
+                    // ★ 缓存读：OpenAI 路径 ZCode 记得到真实值（最高 1.17M/12h），
+                    //   Anthropic 路径此前恒 0。上游没报就如实 0。
+                    "cache_read_input_tokens": self.cached_tokens,
+                },
+            }),
+        );
+        // ★★ 「静默空回合」护栏（2026-10-20 真机取证，`qoder-global:*`）：
+        //   上游返回 **HTTP 200 + 完全空的 SSE 流**（零 content block、零 token），
+        //   转换后就是「message_start → message_delta(end_turn, 0) → message_stop」。
+        //   客户端把这条显示成**空白回答**，用户完全看不出发生了什么。
+        //   这里补一条**可见的错误事件**，把「静默空」变成「明确失败」。
+        //   只在**彻底零产出**时才发 —— 有任何正文 / 工具调用都不触发。
+        //   （与预检不冲突：预检管「错误先于正文」，本护栏管「既无正文也无错误的空流」。）
+        if self.is_silently_empty() {
+            self.emit(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "上游返回了空响应（HTTP 200 但没有任何内容块 / token）。\
+                                    常见原因：上游限流排队（如 Qoder 的 RESOURCE_LIMIT）、\
+                                    账号在目标区域无该模型权限，或上下文超出模型上限。\
+                                    请稍后重试、换模型，或改用非流式请求查看具体错误。",
+                    },
+                }),
+            );
+        }
+        self.emit("message_stop", json!({"type": "message_stop"}));
+    }
+
+    fn fail(&mut self, kind: &str, message: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.emit(
+            "error",
+            json!({"type":"error","error":{"type":kind,"message":message}}),
+        );
+    }
+}
+
+impl<S, E> Stream for AnthropicSseStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(event) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if this.finished {
+                return Poll::Ready(None);
+            }
+            // 直接 Pin::new（S: Unpin 已由 impl 的 where 子句保证），
+            // 不依赖 StreamExt::as_mut，避免额外 trait 导入。
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => this.finalize(),
+                Poll::Ready(Some(Err(error))) => {
+                    eprintln!("[gateway] Anthropic 上游流中途异常: {error:?}");
+                    this.fail("api_error", "上游响应流在完成前中断，请稍后重试。");
+                }
+                Poll::Ready(Some(Ok(chunk))) => this.ingest(&chunk),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn upstream_error_must_not_become_a_successful_empty_turn() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"CALL_COUNT_LIMIT\"}}\n\ndata: [DONE]\n\n"))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let mut output = String::new();
+        while let Some(frame) = stream.next().await {
+            output.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(output.contains("event: error"), "{output}");
+        assert!(output.contains("rate_limit_error"), "{output}");
+        assert!(!output.contains("message_stop"), "{output}");
+        assert!(!output.contains("end_turn"), "{output}");
+    }
+
+    // ── 「用量恒 0 / 输入恒 0 / 思考丢失」回归组（2026-10-21 真机取证）──────
+    //
+    // 背景：走 `/v1/messages`（anthropic-messages 供应商）的记录 input 全 0、
+    // qoder 模型 output 也 0，且 `reasoning_content` 被静默丢弃。可证伪点：
+    // ① 去掉 `finalize` 里 message_delta 的 `input_tokens` ⇒ 用例③变红；
+    // ② 把 `reported_output_tokens` 改回恒 `self.output_tokens` ⇒ 用例①变红；
+    // ③ 删掉 `push_thinking` ⇒ 用例⑤变红。
+
+    async fn drain<S>(stream: &mut AnthropicSseStream<S>) -> String
+    where
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+    {
+        let mut output = String::new();
+        while let Some(frame) = stream.next().await {
+            output.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        output
+    }
+
+    fn message_delta_usage(text: &str) -> Value {
+        let line = text
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("data: ") && line.contains("message_delta"))
+            .expect("必须有 message_delta 事件");
+        let payload = line.strip_prefix("data: ").unwrap().trim();
+        serde_json::from_str::<Value>(payload)
+            .expect("message_delta 必须是合法 JSON")
+            .get("usage")
+            .cloned()
+            .expect("message_delta 必须带 usage")
+    }
+
+    /// ① 上游没报 usage（Qoder 真实形态）但有正文 ⇒ output_tokens 不得为 0。
+    #[tokio::test]
+    async fn unreported_usage_still_reports_nonzero_output_tokens() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\ndata: [DONE]\n\n",
+        ))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let output = drain(&mut stream).await;
+        let usage = message_delta_usage(&output);
+        assert!(
+            usage["output_tokens"].as_u64().unwrap_or(0) > 0,
+            "上游未报 usage 且有产出时 output_tokens 不得为 0：{output}"
+        );
+    }
+
+    /// ② 上游明确报过 usage ⇒ 原样透传，估算不得覆盖。
+    #[tokio::test]
+    async fn reported_usage_is_passed_through_without_estimation() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n"))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let output = drain(&mut stream).await;
+        let usage = message_delta_usage(&output);
+        assert_eq!(usage["input_tokens"], 7, "{output}");
+        assert_eq!(usage["output_tokens"], 3, "{output}");
+    }
+
+    /// ③ 上游不报 prompt_tokens 时按提示词字节数估算，且 message_delta 必须带
+    ///    `input_tokens`（客户端读末尾 usage —— 漏补就是「输入恒 0」的根因）。
+    #[tokio::test]
+    async fn message_delta_carries_input_tokens_estimate_from_prompt_bytes() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        ))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into()).with_prompt_bytes(3000);
+        let output = drain(&mut stream).await;
+        let usage = message_delta_usage(&output);
+        let input = usage["input_tokens"].as_u64().unwrap_or(0);
+        assert!(input > 0, "message_delta 必须带非零 input_tokens：{output}");
+        assert_eq!(
+            input, 1000,
+            "3000 字节 / 3 = 1000（下界量级估算）：{output}"
+        );
+    }
+
+    /// ④ 上游报过 input 时，prompt_bytes 估算**不得覆盖**真实数字。
+    #[tokio::test]
+    async fn reported_input_beats_prompt_bytes_estimate() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":12345,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n"))]);
+        let mut stream =
+            AnthropicSseStream::new(input, "dfmodel".into()).with_prompt_bytes(999_999);
+        let output = drain(&mut stream).await;
+        let usage = message_delta_usage(&output);
+        assert_eq!(usage["input_tokens"], 12345, "{output}");
+    }
+
+    /// ⑤ 上游 `reasoning_content` 不得再被静默丢弃：映射为 thinking 块且计入产出。
+    #[tokio::test]
+    async fn reasoning_content_becomes_a_thinking_block() {
+        let wire = String::from(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思考中\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"答\"}}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(wire))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let output = drain(&mut stream).await;
+        assert!(
+            output.contains("thinking_delta"),
+            "必须有 thinking 块：{output}"
+        );
+        assert!(output.contains("思考中"), "{output}");
+        // thinking → text 块序：思考块必须在正文块开始前关闭（compact JSON）。
+        let thinking_stop = output.find("content_block_stop").unwrap_or(usize::MAX);
+        let text_start = output.find("\"type\":\"text\"").unwrap_or(usize::MAX);
+        assert!(
+            thinking_stop < text_start,
+            "thinking 块必须先于 text 块关闭（块序 thinking→text）：{output}"
+        );
+    }
+
+    /// ⑥ 上游报过缓存读 ⇒ 映射为 `cache_read_input_tokens`（状态栏缓存数据源）。
+    #[tokio::test]
+    async fn cached_tokens_are_surfaced_as_cache_read() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":2304}}}\n\ndata: [DONE]\n\n"))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let output = drain(&mut stream).await;
+        let usage = message_delta_usage(&output);
+        assert_eq!(usage["cache_read_input_tokens"], 2304, "{output}");
+    }
+
+    /// ⑦ 彻底空流（零内容块）必须是**可见错误**，不是「成功的空回合」。
+    #[tokio::test]
+    async fn silently_empty_stream_emits_visible_error() {
+        let input = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: [DONE]\n\n",
+        ))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let output = drain(&mut stream).await;
+        assert!(
+            output.contains("event: error"),
+            "空流必须可见报错：{output}"
+        );
+        assert!(output.contains("message_stop"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn error_after_content_is_terminal_error_not_end_turn() {
+        let input=futures_util::stream::iter(vec![Ok::<_,std::io::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"message\":\"stream interrupted\"}}\n\ndata: [DONE]\n\n"))]);
+        let mut stream = AnthropicSseStream::new(input, "dfmodel".into());
+        let mut output = String::new();
+        while let Some(frame) = stream.next().await {
+            output.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(output.contains("partial"));
+        assert!(output.contains("event: error"));
+        assert!(!output.contains("message_stop"));
+    }
+
+    fn collect_text(events: &[Bytes]) -> String {
+        events
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+            .collect()
+    }
+
+    /// ★★ 两条入口（流式聚合 / 一次性响应）必须产出**同一形状**的 `message`。
+    ///
+    /// 它们共用 [`message_from_accumulator`]，本用例是「共用」这个事实的护栏：
+    /// 若有人日后给其中一条单独加分支，两条路径的 Anthropic 字段映射就会分家，
+    /// 而症状只是「流式对了、非流式少了个字段」这种不报错的偏差。
+    #[test]
+    fn message_from_response_matches_aggregate_message() {
+        // 同一份内容：一份走 SSE（chunk + delta），一份走一次性响应（message）。
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"世界\"},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = json!({
+            "id": "c1",
+            "model": "m1",
+            "choices": [{
+                "message": {"role": "assistant", "content": "你好世界"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        });
+
+        let from_sse = aggregate_message(sse, "fallback");
+        let from_json = message_from_response(&response, "fallback");
+
+        assert_eq!(from_sse["content"], from_json["content"], "正文必须一致");
+        assert_eq!(from_sse["stop_reason"], from_json["stop_reason"]);
+        assert_eq!(from_sse["usage"], from_json["usage"]);
+        assert_eq!(from_json["type"], "message");
+        assert_eq!(from_json["role"], "assistant");
+        assert_eq!(from_json["model"], "m1");
+    }
+
+    /// 一次性响应里的 `tool_calls`（**没有** `index`，不是增量分片）必须按数组顺序
+    /// 落位成 `tool_use`，且 `finish_reason=tool_calls` 映射成 `stop_reason=tool_use`。
+    #[test]
+    fn message_from_response_maps_tool_calls_in_order() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}},
+                        {"id": "call_2", "type": "function", "function": {"name": "write", "arguments": "{\"path\":\"b\"}"}},
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+
+        let message = message_from_response(&response, "m");
+        let content = message["content"].as_array().expect("content 应是数组");
+        assert_eq!(content.len(), 2, "两个工具调用都要落位：{content:?}");
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_1");
+        assert_eq!(content[0]["name"], "read");
+        assert_eq!(content[0]["input"]["path"], "a");
+        assert_eq!(content[1]["id"], "call_2");
+        assert_eq!(content[1]["name"], "write");
+        assert_eq!(
+            message["stop_reason"], "tool_use",
+            "tool_calls 必须映射成 tool_use"
+        );
+    }
+
+    #[test]
+    fn request_maps_system_tools_and_tool_choice() {
+        let anthropic = json!({
+            "model": "m",
+            "max_tokens": 100,
+            "system": "be nice",
+            "stop_sequences": ["END"],
+            "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+            "tool_choice": {"type": "any"},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let upstream = to_upstream_request(&anthropic);
+
+        assert_eq!(upstream["stream"], true);
+        assert_eq!(upstream["stop"], json!(["END"]));
+        assert_eq!(upstream["messages"][0]["role"], "system");
+        assert_eq!(upstream["messages"][0]["content"], "be nice");
+        assert_eq!(upstream["messages"][1]["role"], "user");
+        assert_eq!(upstream["tools"][0]["type"], "function");
+        assert_eq!(upstream["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            upstream["tools"][0]["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(upstream["tool_choice"], "required");
+    }
+
+    #[test]
+    fn request_maps_tool_use_to_tool_calls_and_tool_result_to_tool_role() {
+        let anthropic = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "weather?"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "let me check"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}
+                ]}
+            ]
+        });
+        let upstream = to_upstream_request(&anthropic);
+        let messages = upstream["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "weather?");
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "let me check");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(messages[1]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"SF\"}"
+        );
+
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "toolu_1");
+        assert_eq!(messages[2]["content"], "sunny");
+    }
+
+    /// 同一条 user 消息里既有工具结果又有文本块时，文本必须排在结果**之后**。
+    ///
+    /// `role:"tool"` 必须紧邻发起调用的 assistant 消息；把文本块排到前面会让工具结果
+    /// 与 assistant 隔开，上游判 `tool_call_sequence_broken`（400）。
+    #[test]
+    fn tool_result_precedes_sibling_text_block() {
+        let anthropic = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"},
+                    {"type": "text", "text": "顺带提一句"}
+                ]}
+            ]
+        });
+        let upstream = to_upstream_request(&anthropic);
+        let messages = upstream["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "顺带提一句");
+    }
+
+    #[test]
+    fn tool_choice_tool_maps_to_function_name_and_none_drops_tools() {
+        let tool =
+            json!({"model": "m", "tool_choice": {"type": "tool", "name": "foo"}, "messages": []});
+        assert_eq!(to_upstream_request(&tool)["tool_choice"], "foo");
+
+        let none = json!({"model": "m", "tool_choice": {"type": "none"}, "tools": [{"name": "x", "input_schema": {}}], "messages": []});
+        assert!(to_upstream_request(&none).get("tools").is_none());
+    }
+
+    #[test]
+    fn stop_reason_mapping_is_three_state() {
+        assert_eq!(map_stop_reason(Some("stop")), "end_turn");
+        assert_eq!(map_stop_reason(Some("length")), "max_tokens");
+        assert_eq!(map_stop_reason(Some("tool_calls")), "tool_use");
+        assert_eq!(map_stop_reason(None), "end_turn");
+    }
+
+    #[test]
+    fn aggregate_message_builds_tool_use() {
+        let sse =             "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n";
+        let message = aggregate_message(sse, "fallback");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(message["content"][0]["type"], "tool_use");
+        assert_eq!(message["content"][0]["name"], "f");
+        assert_eq!(message["content"][0]["input"]["a"], 1);
+    }
+
+    #[tokio::test]
+    async fn stream_emits_full_anthropic_event_sequence_for_text() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            concat!(
+                "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        ))];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+
+        let order = [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        let mut cursor = 0usize;
+        for name in order {
+            let found = text[cursor..].find(name).map(|offset| cursor + offset);
+            assert!(found.is_some(), "缺少事件 {name}：{text}");
+            cursor = found.unwrap() + name.len();
+        }
+        assert!(text.contains("Hi"));
+        assert!(text.contains(" there"));
+        assert!(text.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[tokio::test]
+    async fn stream_reassembles_sse_line_split_across_chunks() {
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"split\"}}]}\n";
+        let second = b"\ndata: [DONE]\n\n";
+        let split_at = first.len() / 2;
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&first[..split_at])),
+            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&first[split_at..])),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(second)),
+        ];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+        assert!(text.contains("split"));
+        assert!(text.contains("message_start"));
+        assert!(text.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_tool_use_block_and_input_json_delta() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        ))];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("\"name\":\"f\""));
+        assert!(text.contains("\"type\":\"input_json_delta\""));
+        assert!(text.contains("{\\\"a\\\""));
+        assert!(text.contains(":1}"));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(text.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn stream_captures_usage_and_closes_text_before_tool_block() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            concat!(
+                "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"before\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        ))];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+        let text_stop = text.find("content_block_stop").unwrap();
+        let tool_start = text.find("\"type\":\"tool_use\"").unwrap();
+        assert!(text_stop < tool_start, "文本块必须在工具块前关闭");
+        assert!(text.contains("\"output_tokens\":3"));
+    }
+
+    #[tokio::test]
+    async fn stream_supports_two_parallel_tool_blocks() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"one\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"two\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        ))];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+        assert_eq!(text.matches("\"type\":\"tool_use\"").count(), 2);
+        assert_eq!(text.matches("event: content_block_stop").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_still_emits_start_and_stop_on_empty_upstream() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+        assert!(text.contains("message_start"));
+        assert!(text.contains("message_stop"));
+    }
+
+    /// 空值形态的 `finish_reason`（`""` 或 `null`）**不是**终止信号。
+    ///
+    /// 上游（OpenAI 兼容实现）在中间分片里把 `finish_reason` 写成空串而非 `null` 是常见
+    /// 现象。若把「键存在且能读成字符串」当成终止，转换流会在**第一个**分片就 `finalize`，
+    /// 客户端（Claude Code）看到的现象是「流式对话刚开始就断了」。
+    ///
+    /// 注意每个 SSE 帧必须是**独立的 chunk**：真实网络下逐帧到达。若把全部帧塞进同一个
+    /// chunk，`ingest` 的循环会无视 `finished` 继续处理后续帧，从而掩盖提前终止的缺陷。
+    #[tokio::test]
+    async fn stream_does_not_finalize_on_empty_finish_reason() {
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"\"}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+
+        assert!(text.contains("Hi"), "首个分片的内容必须送达：{text}");
+        assert!(
+            text.contains(" there"),
+            "空值 finish_reason 不得提前结束流，后续分片必须继续送达：{text}"
+        );
+        assert_eq!(
+            text.matches("\"stop_reason\":\"end_turn\"").count(),
+            1,
+            "只允许一个 message_delta 终止事件：{text}"
+        );
+        assert!(text.contains("message_stop"), "{text}");
+    }
+}

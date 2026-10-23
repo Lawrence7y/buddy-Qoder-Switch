@@ -1,0 +1,15 @@
+{
+  "name": "@nextagentx/buddy-switch-win32-x64",
+  "version": "2026.10.201902",
+  "description": "Buddy Switch platform binary (win32-x64)",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

@@ -1,0 +1,113 @@
+# --- W00 证据归档元数据（YAML） ---
+# original_path: D:\Project\buddy-Qoder-Switch\reports\wb-live\status-cn-a93567.json
+# original_sha256: 66ce48545a0f9f35073e8df1c51c2ac08846d0f693bc4c4a9cdf052c09ec5753
+# collected_at: 2026-10-22 00:10:54 (+0800, 文件 mtime)
+# archived_at: 2026-10-22 (本任务执行时)
+# scope: WorkBuddy CN 签到状态真机响应（账号尾部 a93567）；checkin.rs:1110 引用；文件名内 6 位为已掩码 uid 尾段
+# sanitization: 原件生产时已脱敏（uid_masked）；仅含签到日历/积分数值
+# --- 以下为原件正文，逐字节未改动 ---
+{
+  "generated_at": "2026-10-21T16:10:54Z",
+  "uid_masked": "…a93567",
+  "steps": [
+    {
+      "step": "status:checkin-activity-status",
+      "url": "https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status",
+      "http_status": 200,
+      "error": null,
+      "body": {
+        "code": 0,
+        "msg": "OK",
+        "requestId": "461a0763-c272-4f11-b94d-7da07923dcaa",
+        "data": {
+          "active": true,
+          "today_checked_in": false,
+          "streak_days": 19,
+          "daily_credit": 100,
+          "today_credit": 100,
+          "is_streak_day": false,
+          "next_streak_day": 0,
+          "streak_bonus_days": 0,
+          "streak_bonus_credit": 0,
+          "checkin_dates": [
+            "2026-10-21",
+            "2026-10-20",
+            "2026-10-19",
+            "2026-10-18",
+            "2026-10-17",
+            "2026-10-16",
+            "2026-10-15",
+            "2026-10-14",
+            "2026-10-13",
+            "2026-10-12",
+            "2026-10-11",
+            "2026-10-10",
+            "2026-10-06",
+            "2026-10-05",
+            "2026-10-04",
+            "2026-10-03",
+            "2026-10-02",
+            "2026-10-01",
+            "2026-09-30"
+          ],
+          "week_checkin_days": 3,
+          "week_progress": [
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          "total_credits": 1900,
+          "start_time": "2026-09-30 00:00:00",
+          "end_time": "2026-11-30 23:59:59",
+          "theme_name": "Buddy加油站",
+          "season": 10,
+          "activity_name": "Buddy应用",
+          "claim_button_text": "立即领取",
+          "action_button": {
+            "show": true,
+            "text": "体验Buddy应用",
+            "action": "workbuddy://home?openBuddySwitcher=true"
+          }
+        }
+      },
+      "body_head": null
+    }
+  ],
+  "analysis": {
+    "json": true,
+    "top_code": 0,
+    "top_message": "OK",
+    "keys_at_data": [
+      "action_button",
+      "active",
+      "activity_name",
+      "checkin_dates",
+      "claim_button_text",
+      "daily_credit",
+      "end_time",
+      "is_streak_day",
+      "next_streak_day",
+      "season",
+      "start_time",
+      "streak_bonus_credit",
+      "streak_bonus_days",
+      "streak_days",
+      "theme_name",
+      "today_checked_in",
+      "today_credit",
+      "total_credits",
+      "week_checkin_days",
+      "week_progress"
+    ],
+    "TODAY_KEY_HIT": {
+      "key_value": false
+    },
+    "predicate_todayCheckedIn": false,
+    "checked_alone_value": null,
+    "note": "predicate uses dig_any over 7 keys, depth<=3, truthy() semantics"
+  }
+}

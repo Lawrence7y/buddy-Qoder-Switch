@@ -1,0 +1,151 @@
+{
+  "scope": "wb-cn",
+  "summary": {
+    "currentRemaining": 15.0,
+    "totalRemainingBalance": 15.0,
+    "totalOriginalCapacity": 20.0,
+    "periodOut": 1.0,
+    "expiringSoon": 15.0,
+    "expiringWithin7DaysCount": 1,
+    "expiringWithin7DaysAmount": 15.0,
+    "currency": "credits",
+    "totalAccounts": 1,
+    "activeAccounts": 1,
+    "totalPackages": 1,
+    "isKnown": true
+  },
+  "stats": {
+    "currentRemaining": 15.0,
+    "totalRemainingBalance": 15.0,
+    "totalOriginalCapacity": 20.0,
+    "periodOut": 1.0,
+    "expiringSoon": 15.0,
+    "expiringWithin7DaysCount": 1,
+    "expiringWithin7DaysAmount": 15.0,
+    "currency": "credits",
+    "totalAccounts": 1,
+    "activeAccounts": 1,
+    "totalPackages": 1,
+    "isKnown": true
+  },
+  "packages": [
+    {
+      "id": 1,
+      "scope": "wb-cn",
+      "accountId": "fixture",
+      "accountName": "Fixture Account",
+      "packageId": "pkg-1",
+      "name": "通用积分包",
+      "packageName": "通用积分包",
+      "packageType": "plan",
+      "remaining": 15.0,
+      "remainingBalance": 15.0,
+      "total": 20.0,
+      "originalCapacity": 20.0,
+      "unit": "credits",
+      "expireAtMs": 1700259200000,
+      "expireTime": 1700259200,
+      "expireTimeFormatted": "2023-11-18",
+      "isInferred": false,
+      "isStale": false,
+      "source": "official",
+      "sourceType": "official",
+      "observedAtMs": 1700000000000,
+      "observedAt": 1700000000,
+      "status": "active"
+    }
+  ],
+  "calendar": [
+    {
+      "date": "2023-11-18",
+      "timestampMs": 1700259200000,
+      "daysUntil": 3,
+      "daysRemaining": 3,
+      "totalExpiring": 15.0,
+      "count": 1,
+      "packageCount": 1,
+      "items": [
+        {
+          "key": "fixture-pkg-1-1700259200000",
+          "scope": "wb-cn",
+          "accountId": "fixture",
+          "accountName": "Fixture Account",
+          "packageId": "pkg-1",
+          "packageName": "通用积分包",
+          "packageType": "plan",
+          "remaining": 15.0,
+          "amount": 15.0,
+          "total": 20.0,
+          "unit": "credits",
+          "expireAtMs": 1700259200000,
+          "expireTime": 1700259200,
+          "daysRemaining": 3
+        }
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "id": 1,
+      "scope": "wb-cn",
+      "accountId": "fixture",
+      "source": "official",
+      "remaining": 15.0,
+      "total": 20.0,
+      "unit": "credits",
+      "isStale": false,
+      "isComparable": true,
+      "observedAtMs": 1700000000000
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "scope": "wb-cn",
+      "accountId": "fixture",
+      "accountName": "Fixture Account",
+      "eventId": "fixture-0",
+      "eventKind": "usage",
+      "eventType": "usage",
+      "amount": 1.0,
+      "changeAmount": -1.0,
+      "balanceAfter": 0.0,
+      "unit": "credits",
+      "occurredAtMs": 1699996400000,
+      "recordedAt": 1699996400,
+      "evidenceLevel": "official_api",
+      "note": "fixture",
+      "reason": "fixture"
+    }
+  ],
+  "recentEvents": [
+    {
+      "id": 1,
+      "scope": "wb-cn",
+      "accountId": "fixture",
+      "accountName": "Fixture Account",
+      "eventId": "fixture-0",
+      "eventKind": "usage",
+      "eventType": "usage",
+      "amount": 1.0,
+      "changeAmount": -1.0,
+      "balanceAfter": 0.0,
+      "unit": "credits",
+      "occurredAtMs": 1699996400000,
+      "recordedAt": 1699996400,
+      "evidenceLevel": "official_api",
+      "note": "fixture",
+      "reason": "fixture"
+    }
+  ],
+  "status": {
+    "isStale": false,
+    "lastUpdatedMs": 1700000000000,
+    "sourceKind": "official",
+    "code": "live",
+    "message": "官方积分实时同步",
+    "observedAt": 1700000000,
+    "cachedAt": 1700000000,
+    "ttlRemainingSeconds": 300
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "scope": "wb-cn",
+  "summary": {
+    "currentRemaining": 0.0,
+    "totalRemainingBalance": 0.0,
+    "totalOriginalCapacity": 0.0,
+    "expiringSoon": 0.0,
+    "expiringWithin7DaysCount": 0,
+    "expiringWithin7DaysAmount": 0.0,
+    "currency": "credits",
+    "totalAccounts": 0,
+    "activeAccounts": 0,
+    "totalPackages": 0,
+    "isKnown": false
+  },
+  "stats": {
+    "currentRemaining": 0.0,
+    "totalRemainingBalance": 0.0,
+    "totalOriginalCapacity": 0.0,
+    "expiringSoon": 0.0,
+    "expiringWithin7DaysCount": 0,
+    "expiringWithin7DaysAmount": 0.0,
+    "currency": "credits",
+    "totalAccounts": 0,
+    "activeAccounts": 0,
+    "totalPackages": 0,
+    "isKnown": false
+  },
+  "packages": [],
+  "calendar": [],
+  "observations": [],
+  "events": [],
+  "recentEvents": [],
+  "status": {
+    "isStale": false,
+    "sourceKind": "unknown",
+    "code": "unobserved",
+    "message": "尚未获取到积分观测数据",
+    "observedAt": 0
+  }
+}

@@ -1,0 +1,27 @@
+# --- W00 证据归档元数据（YAML） ---
+# original_path: D:\Project\buddy-Qoder-Switch\reports\wb-live\global-checkin-endpoint-existence.json
+# original_sha256: 29d26b0ceadaf23097f3a36b1ac8f9e1acd6e7d46c87d4b70aebea705aa72a09
+# collected_at: 2026-10-21 00:21:34 (+0800, 文件 mtime)
+# archived_at: 2026-10-22 (本任务执行时)
+# scope: Global 域签到端点存在性探针；checkin.rs:364/:1218 引用
+# sanitization: 原件生产时已脱敏（uid_masked）；requestId 为服务端请求号，保留
+# --- 以下为原件正文，逐字节未改动 ---
+{
+  "generated_at": "2026-10-20T16:21:34Z",
+  "note": "Global host probed with GLOBAL token: do CN-style checkin endpoints exist?",
+  "uid_masked": "...9baae0",
+  "results": {
+    "/v2/billing/meter/checkin-activity-status": {
+      "http": 200,
+      "body": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"b3b9912c-000e-4df5-b347-82d799f2da24\",\"data\":{\"active\":false,\"today_checked_in\":false,\"streak_days\":0,\"daily_credit\":100,\"today_credit\":100,\"is_streak_day\":false,\"nex"
+    },
+    "/v2/billing/meter/checkin-status": {
+      "http": 200,
+      "body": "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"209c105b-ee41-4fa5-b892-3b27ba9fea4c\",\"data\":{\"active\":false,\"today_checked_in\":false,\"streak_days\":0,\"daily_credit\":0,\"today_credit\":0,\"is_streak_day\":false,\"next_st"
+    },
+    "/v2/billing/meter/daily-checkin": {
+      "http": 400,
+      "body": "{\"code\":10001,\"msg\":\"签到活动未开启或已过期\",\"requestId\":\"879dfe5d-ec15-47f7-a021-1acd88597e33\"}"
+    }
+  }
+}

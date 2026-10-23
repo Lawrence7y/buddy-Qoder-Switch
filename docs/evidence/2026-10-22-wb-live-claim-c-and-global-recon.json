@@ -1,0 +1,88 @@
+# --- W00 证据归档元数据（YAML） ---
+# original_path: D:\Project\buddy-Qoder-Switch\reports\wb-live\claim-c-and-global-recon.json
+# original_sha256: 6f7b90ffe27697c4bc63250da284ec32a4559664259dc020492bbe858aeaf8f5
+# collected_at: 2026-10-21 00:19:35 (+0800, 文件 mtime)
+# archived_at: 2026-10-22 (本任务执行时)
+# scope: WorkBuddy CN 重复提交守卫 + Global 只读侦察真机记录；checkin.rs:507/:1109 引用
+# sanitization: 原件生产时已脱敏（uid_masked、含邮箱 body 已标 redacted）；本次复核未发现新泄漏
+# --- 以下为原件正文，逐字节未改动 ---
+{
+  "generated_at": "2026-10-20T16:19:01Z",
+  "cn_duplicate_submit": {
+    "uid_masked": "…a93567",
+    "duplicate_submit_sent": false,
+    "why_not_sent": "服务端 today_checked_in=true（今日已签到）；任务授权仅在“尚未签到”时 POST。重复提交未获授权，故未发送。",
+    "status_http": 200,
+    "today_checked_in": true,
+    "today_checked_in_type": "bool",
+    "streak_days": 19,
+    "total_credits": 1900,
+    "daily_credit": 100,
+    "today_credit": 100,
+    "checkin_dates_head": [
+      "2026-10-21",
+      "2026-10-20",
+      "2026-10-19"
+    ],
+    "predicate_keys": [
+      "today_checked_in",
+      "todayCheckedIn",
+      "checked_in",
+      "checkedIn",
+      "is_checked",
+      "isChecked",
+      "checked"
+    ],
+    "predicate_conclusion_todayCheckedIn": true,
+    "submit_side_already_phrasing": "未验证",
+    "submit_side_reason": "为避免重复写入未发送 daily-checkin；code=10001 / 已签到 / repeat / already 未经真实服务端验证"
+  },
+  "global_readonly_recon": {
+    "conversations_list": {
+      "url": "https://www.workbuddy.ai/console/as/conversations/",
+      "method": "GET",
+      "http_status": 200,
+      "error": null,
+      "body_head": "(redacted: contains account email in manifest.envs)",
+      "conversation_summary": [
+        {
+          "id_prefix_len": 19,
+          "name": "Start new coding session",
+          "status": "completed",
+          "sessionStatus": "completed",
+          "has_manifest": true
+        }
+      ],
+      "conversation_count": 1
+    },
+    "conversation_state_missing_id": {
+      "url": "https://www.workbuddy.ai/console/as/conversations/__wb-live-probe-none",
+      "method": "GET",
+      "http_status": 404,
+      "error": null,
+      "body_head": "{\"code\": 14284, \"msg\": \"conversation not found\", \"requestId\": \"<REDACTED:uuid>\"}"
+    },
+    "resource_summary": {
+      "url": "https://www.workbuddy.ai/v2/billing/meter/get-user-resource-summary",
+      "method": "POST",
+      "http_status": 404,
+      "error": null,
+      "body_head": "{\"error_msg\": \"404 Route Not Found\"}"
+    },
+    "global_balance_total_dosage": null,
+    "global_uid_masked": "…9baae0",
+    "resource_http_status": 0
+  },
+  "cn_deprecated_fallback": {
+    "url": "https://www.codebuddy.cn/v2/billing/meter/checkin-status",
+    "http_status": 200,
+    "code": 0,
+    "today_checked_in": false,
+    "checkin_dates": null,
+    "total_credits": 0,
+    "active": false,
+    "is_ok_response_would_be_true": true,
+    "predicate_would_conclude": "Submit (todayCheckedIn=false)",
+    "hazard": "该端点返回 200/code=0 但是空壳（today_checked_in=false、total_credits=0）；get_checkin_status_for 在首个端点失败时回退到它，会把「今日已签到」误判为「未签到」"
+  }
+}

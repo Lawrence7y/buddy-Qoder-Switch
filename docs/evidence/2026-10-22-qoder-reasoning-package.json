@@ -1,0 +1,28 @@
+# --- W00 证据归档元数据（YAML） ---
+# original_path: D:\Project\buddy-Qoder-Switch\reports\qoder-reasoning-package.json
+# original_sha256: 48cd76434dd8dfd3b84f3d45076fe6007008802a8a72bd36d8720fef017b11f8
+# collected_at: 2026-10-22 11:05:05 (+0800, 文件 mtime)
+# archived_at: 2026-10-22 (本任务执行时)
+# scope: 上轮候选包元数据（包/EXE SHA256、网关测试计数、探针结论）；PRD §3.1 引用
+# sanitization: 仅含哈希与测试计数，无敏感字段
+# --- 以下为原件正文，逐字节未改动 ---
+{
+  "package": "D:\\Project\\buddy-Qoder-Switch\\release\\BuddySwitch-Fusion-Preview-20261022-reasoning-fix.zip",
+  "packageSha256": "467E83539829A38E2F9F4584CAE9460679DD64C237618738DDB6FC5D0EF04EEC",
+  "exeSha256": "E3B3D1FE34D971BC9691F09422193BC526CBBB10365888510E82561E116ADB53",
+  "archiveExeVerified": true,
+  "gatewayTests": {
+    "ignored": 5,
+    "failed": 0,
+    "passed": 731
+  },
+  "rawTimingUnitTestsPassed": 1,
+  "liveProbe": {
+    "cn": "HTTP200/business429/no-output",
+    "global": "HTTP200/business429/no-output"
+  },
+  "globalTruncationVerifiedFixed": false,
+  "actualTokenThroughputMeasured": false,
+  "globalCheckinChanged": false,
+  "runningInstanceReplaced": false
+}

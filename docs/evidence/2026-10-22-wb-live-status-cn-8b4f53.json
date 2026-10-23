@@ -1,0 +1,100 @@
+# --- W00 证据归档元数据（YAML） ---
+# original_path: D:\Project\buddy-Qoder-Switch\reports\wb-live\status-cn-8b4f53.json
+# original_sha256: 2676367e37205c3245714ec9d901383d7e34c73e7e9464fc87316429645c6be9
+# collected_at: 2026-10-22 00:11:25 (+0800, 文件 mtime)
+# archived_at: 2026-10-22 (本任务执行时)
+# scope: WorkBuddy CN 签到状态真机响应（账号尾部 8b4f53）；checkin.rs:360 status-cn-* 引用
+# sanitization: 同上：原件已脱敏（uid_masked）
+# --- 以下为原件正文，逐字节未改动 ---
+{
+  "generated_at": "2026-10-21T16:11:25Z",
+  "uid_masked": "…8b4f53",
+  "steps": [
+    {
+      "step": "status:checkin-activity-status",
+      "url": "https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status",
+      "http_status": 200,
+      "error": null,
+      "body": {
+        "code": 0,
+        "msg": "OK",
+        "requestId": "0ba5a9b4-a4ed-42f3-b95a-5170fce1b2c9",
+        "data": {
+          "active": true,
+          "today_checked_in": false,
+          "streak_days": 6,
+          "daily_credit": 100,
+          "today_credit": 100,
+          "is_streak_day": false,
+          "next_streak_day": 0,
+          "streak_bonus_days": 0,
+          "streak_bonus_credit": 0,
+          "checkin_dates": [
+            "2026-10-21",
+            "2026-10-20",
+            "2026-10-19",
+            "2026-10-18",
+            "2026-10-17",
+            "2026-10-16"
+          ],
+          "week_checkin_days": 3,
+          "week_progress": [
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          "total_credits": 600,
+          "start_time": "2026-09-30 00:00:00",
+          "end_time": "2026-11-30 23:59:59",
+          "theme_name": "Buddy加油站",
+          "season": 10,
+          "activity_name": "Buddy应用",
+          "claim_button_text": "立即领取",
+          "action_button": {
+            "show": true,
+            "text": "体验Buddy应用",
+            "action": "workbuddy://home?openBuddySwitcher=true"
+          }
+        }
+      },
+      "body_head": null
+    }
+  ],
+  "analysis": {
+    "json": true,
+    "top_code": 0,
+    "top_message": "OK",
+    "keys_at_data": [
+      "action_button",
+      "active",
+      "activity_name",
+      "checkin_dates",
+      "claim_button_text",
+      "daily_credit",
+      "end_time",
+      "is_streak_day",
+      "next_streak_day",
+      "season",
+      "start_time",
+      "streak_bonus_credit",
+      "streak_bonus_days",
+      "streak_days",
+      "theme_name",
+      "today_checked_in",
+      "today_credit",
+      "total_credits",
+      "week_checkin_days",
+      "week_progress"
+    ],
+    "TODAY_KEY_HIT": {
+      "key_value": false
+    },
+    "predicate_todayCheckedIn": false,
+    "checked_alone_value": null,
+    "note": "predicate uses dig_any over 7 keys, depth<=3, truthy() semantics"
+  }
+}
